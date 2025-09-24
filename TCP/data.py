@@ -7,6 +7,11 @@ from torchvision import transforms as T
 
 from TCP.augment import hard as augmenter
 
+
+from torchvision import transforms
+import cv2
+import matplotlib.pyplot as plt
+
 class CARLA_Data(Dataset):
 
 	def __init__(self, root, data_folders, img_aug = False):
@@ -74,7 +79,7 @@ class CARLA_Data(Dataset):
 			self.action_mu += data['action_mu']
 			self.action_sigma += data['action_sigma']
 			self.only_ap_brake += data['only_ap_brake']
-		self._im_transform = T.Compose([T.ToTensor(), T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])
+		#self._im_transform = T.Compose([T.ToTensor(), T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])
 
 	def __len__(self):
 		"""Returns the length of the dataset. """
@@ -85,12 +90,25 @@ class CARLA_Data(Dataset):
 		data = dict()
 		data['front_img'] = self.front_img[index]
 
-		if self.img_aug:
-			data['front_img'] = self._im_transform(augmenter(self._batch_read_number).augment_image(np.array(
-					Image.open(self.root+self.front_img[index][0]))))
-		else:
-			data['front_img'] = self._im_transform(np.array(
-					Image.open(self.root+self.front_img[index][0])))
+		#if self.img_aug:
+		#	data['front_img'] = self._im_transform(augmenter(self._batch_read_number).augment_image(np.array(
+		#			Image.open(self.root+self.front_img[index][0]))))
+		#else:
+		#	data['front_img'] = self._im_transform(np.array(
+		#			Image.open(self.root+self.front_img[index][0])))
+
+
+		pil_img = Image.open(self.root+self.front_img[index][0]) 
+		image = np.array(pil_img) 
+		data['front_img'] = self.preprocessing(image)
+
+
+		#if self.img_aug: 
+		#	pil_img = Image.open(self.root+self.front_img[index][0]) 
+		#	aug_img = augmenter(self._batch_read_number).augment_image(np.array(pil_img)) 
+		#	data['front_img'] = self._im_transform(Image.fromarray(aug_img)) 
+		#else: 
+		#	data['front_img'] = self._im_transform(Image.open(self.root+self.front_img[index][0]))
 
 		# fix for theta=nan in some measurements
 		if np.isnan(self.theta[index][0]):
@@ -107,7 +125,7 @@ class CARLA_Data(Dataset):
 			[np.sin(np.pi/2+ego_theta),  np.cos(np.pi/2+ego_theta)]
 			])
 			local_command_point = np.array([self.future_y[index][i]-ego_y, self.future_x[index][i]-ego_x] )
-			local_command_point = R.T.dot(local_command_point)
+			local_command_point = R.T.dot(local_command_point) / 10.0
 			waypoints.append(local_command_point)
 
 		data['waypoints'] = np.array(waypoints)
@@ -153,7 +171,7 @@ class CARLA_Data(Dataset):
 		data['speed'] = self.speed[index]
 		data['feature'] = self.feature[index]
 		data['value'] = self.value[index]
-		command = self.command[index]
+		command = int(self.command[index])
 
 		# VOID = -1
 		# LEFT = 1
@@ -172,6 +190,72 @@ class CARLA_Data(Dataset):
 
 		self._batch_read_number += 1
 		return data
+
+	def crop_image_donkey(self, image: np.ndarray):
+		return image[60:, :, :]
+
+	def resize_image_donkey(self, image: np.ndarray):
+		return cv2.resize(image, (320, 240), interpolation=cv2.INTER_AREA)
+
+	def bgr2yuv(self, image: np.ndarray):
+		return cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+
+	def preprocessing(self, image: np.ndarray):
+		image = self.crop_image_donkey(image)
+		image = self.resize_image_donkey(image)
+		image = self.bgr2yuv(image)
+
+		from torchvision import transforms
+
+		transform = transforms.Compose([
+			transforms.ToPILImage(),                  # If image is NumPy array
+			transforms.ToTensor(),                   # Converts to [C, H, W] and scales to [0,1]
+		])
+
+		return transform(image)
+
+	def preprocessing_old(self, image: np.ndarray):
+		plt.imshow(image)
+		plt.title("Original image")
+		plt.axis('off')
+		plt.show()
+
+		image = self.crop_image_donkey(image)
+		plt.imshow(image)
+		plt.title("After crop_image_donkey")
+		plt.axis('off')
+		plt.show()
+
+		image = self.resize_image_donkey(image)
+		plt.imshow(image)
+		plt.title("After resize_image_donkey")
+		plt.axis('off')
+		plt.show()
+
+		image = self.bgr2yuv(image)
+		plt.imshow(image)
+		plt.title("After bgr2yuv")
+		plt.axis('off')
+		plt.show()
+
+		from torchvision import transforms
+
+		transform = transforms.Compose([
+			transforms.ToPILImage(),  # NumPy array'i PIL Image yapar
+			transforms.ToTensor(),    # [H, W, C] -> [C, H, W] ve [0, 255] -> [0, 1]
+		])
+
+		tensor_image = transform(image)
+
+		# Tensoru numpy formatında görselleştirmek için:
+		img_np = tensor_image.permute(1, 2, 0).numpy()
+		plt.imshow(img_np)
+		plt.title("After torchvision transforms (Tensor to numpy)")
+		plt.axis('off')
+		plt.show()
+
+		return tensor_image
+
 
 
 def scale_and_crop_image(image, scale=1, crop_w=256, crop_h=256):
@@ -266,6 +350,3 @@ def get_action_beta(alpha, beta):
 		x = x * 2 - 1
 
 		return x
-
-
-	

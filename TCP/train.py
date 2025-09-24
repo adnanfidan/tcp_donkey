@@ -30,8 +30,8 @@ class TCP_planner(pl.LightningModule):
 		rl_state_dict = torch.load(self.config.rl_ckpt, map_location='cpu')['policy_state_dict']
 		self._load_state_dict(self.model.value_branch_traj, rl_state_dict, 'value_head')
 		self._load_state_dict(self.model.value_branch_ctrl, rl_state_dict, 'value_head')
-		self._load_state_dict(self.model.dist_mu, rl_state_dict, 'dist_mu')
-		self._load_state_dict(self.model.dist_sigma, rl_state_dict, 'dist_sigma')
+		#self._load_state_dict(self.model.dist_mu, rl_state_dict, 'dist_mu')
+		#self._load_state_dict(self.model.dist_sigma, rl_state_dict, 'dist_sigma')
 
 	def _load_state_dict(self, il_net, rl_state_dict, key_word):
 		rl_keys = [k for k in rl_state_dict.keys() if key_word in k]
@@ -47,46 +47,121 @@ class TCP_planner(pl.LightningModule):
 
 	def training_step(self, batch, batch_idx):
 		front_img = batch['front_img']
-		speed = batch['speed'].to(dtype=torch.float32).view(-1,1) / 12.
+		speed = batch['speed'].to(dtype=torch.float32).view(-1, 1) / 12.0
 		target_point = batch['target_point'].to(dtype=torch.float32)
-		command = batch['target_command']
-		
-		state = torch.cat([speed, target_point, command], 1)
-		value = batch['value'].view(-1,1)
-		feature = batch['feature']
+		command = batch['target_command'].to(dtype=torch.float32)
 
-		gt_waypoints = batch['waypoints']
+		state = torch.cat([speed, target_point, command], 1)
+		value = batch['value'].to(dtype=torch.float32).view(-1, 1)
+		feature = batch['feature'].to(dtype=torch.float32)
+		gt_waypoints = batch['waypoints'].to(dtype=torch.float32)
 
 		pred = self.model(front_img, state, target_point)
 
-		dist_sup = Beta(batch['action_mu'], batch['action_sigma'])
-		dist_pred = Beta(pred['mu_branches'], pred['sigma_branches'])
-		kl_div = torch.distributions.kl_divergence(dist_sup, dist_pred)
-		action_loss = torch.mean(kl_div[:, 0]) *0.5 + torch.mean(kl_div[:, 1]) *0.5
+		# ---- hız, değer, özellik, wp kayıpları ----
 		speed_loss = F.l1_loss(pred['pred_speed'], speed) * self.config.speed_weight
-		value_loss = (F.mse_loss(pred['pred_value_traj'], value) + F.mse_loss(pred['pred_value_ctrl'], value)) * self.config.value_weight
-		feature_loss = (F.mse_loss(pred['pred_features_traj'], feature) +F.mse_loss(pred['pred_features_ctrl'], feature))* self.config.features_weight
+		value_loss = (F.mse_loss(pred['pred_value_traj'], value) +
+						F.mse_loss(pred['pred_value_ctrl'], value)) * self.config.value_weight
+		feature_loss = (F.mse_loss(pred['pred_features_traj'], feature) +
+						F.mse_loss(pred['pred_features_ctrl'], feature)) * self.config.features_weight
+		
+		loss_wp = F.l1_loss(pred['pred_wp'], gt_waypoints, reduction='none').mean()
+		
+		pred_vec = pred['pred_wp'][:, -1, :] - pred['pred_wp'][:, 0, :]
+		gt_vec   = gt_waypoints[:, -1, :]    - gt_waypoints[:, 0, :]
+		loss_heading = F.l1_loss(pred_vec, gt_vec)
+		
 
-		future_feature_loss = 0
-		future_action_loss = 0
+		if pred['pred_wp'].shape[1] > 2:
+			loss_smooth = F.l1_loss(pred['pred_wp'][:, 2:] - 2*pred['pred_wp'][:, 1:-1] + pred['pred_wp'][:, :-2], torch.zeros_like(pred['pred_wp'][:, 2:]))
+		else:
+			loss_smooth = torch.tensor(0.0, device=pred['pred_wp'].device)
+		
+		wp_loss = loss_wp + 0.5*loss_heading + 0.1*loss_smooth
+
+		# ---- gelecek özellik kaybı ----
+		future_feature_loss = 0.0
 		for i in range(self.config.pred_len):
-			dist_sup = Beta(batch['future_action_mu'][i], batch['future_action_sigma'][i])
-			dist_pred = Beta(pred['future_mu'][i], pred['future_sigma'][i])
-			kl_div = torch.distributions.kl_divergence(dist_sup, dist_pred)
-			future_action_loss += torch.mean(kl_div[:, 0]) *0.5 + torch.mean(kl_div[:, 1]) *0.5
-			future_feature_loss += F.mse_loss(pred['future_feature'][i], batch['future_feature'][i]) * self.config.features_weight
+			future_feature_loss += F.mse_loss(
+				pred['future_feature'][i],
+				batch['future_feature'][i].to(dtype=torch.float32)
+			) * self.config.features_weight
 		future_feature_loss /= self.config.pred_len
-		future_action_loss /= self.config.pred_len
-		wp_loss = F.l1_loss(pred['pred_wp'], gt_waypoints, reduction='none').mean()
-		loss = action_loss + speed_loss + value_loss + feature_loss + wp_loss+ future_feature_loss + future_action_loss
-		self.log('train_action_loss', action_loss.item())
+
+		# ---- aksiyon L1 (deterministik) ----
+		# pred['action'] shape: [B,2] -> [acc_like, steer] ∈ [-1,1]
+		acc_like = torch.clamp(pred['action'][:, 0], -1.0, 1.0)
+		steer_pred = torch.clamp(pred['action'][:, 1], -1.0, 1.0)
+		throttle_pred = torch.clamp(acc_like, 0.0, 1.0)
+		brake_pred = torch.clamp(-acc_like, 0.0, 1.0)
+
+		# ground truth: batch['action'] = [throttle, steer, brake]
+		throttle_gt = batch['action'][:, 0].to(dtype=torch.float32)
+		steer_gt    = batch['action'][:, 1].to(dtype=torch.float32)
+		brake_gt    = batch['action'][:, 2].to(dtype=torch.float32)
+
+		batch_throttle_l1 = torch.mean(torch.abs(throttle_pred - throttle_gt))
+		batch_steer_l1    = torch.mean(torch.abs(steer_pred    - steer_gt))
+		batch_brake_l1    = torch.mean(torch.abs(brake_pred    - brake_gt))
+
+		# ---- toplam loss ----
+		# orijinal toplamla uyumlu: wp + (aksiyon L1'ler) + diğerleri
+		loss = (speed_loss + value_loss + feature_loss + wp_loss +
+				future_feature_loss +
+				batch_throttle_l1 + 5 * batch_steer_l1 + batch_brake_l1)
+
+		# ---- log ----
 		self.log('train_wp_loss_loss', wp_loss.item())
 		self.log('train_speed_loss', speed_loss.item())
 		self.log('train_value_loss', value_loss.item())
 		self.log('train_feature_loss', feature_loss.item())
 		self.log('train_future_feature_loss', future_feature_loss.item())
-		self.log('train_future_action_loss', future_action_loss.item())
+		self.log('train_throttle_l1', batch_throttle_l1.item())
+		self.log('train_steer_l1', batch_steer_l1.item())
+		self.log('train_brake_l1', batch_brake_l1.item())
+
 		return loss
+
+	def training_step_old(self, batch, batch_idx):
+		front_img = batch['front_img']
+		speed = batch['speed'].to(dtype=torch.float32).view(-1,1) / 12.
+		target_point = batch['target_point'].to(dtype=torch.float32)
+		command = batch['target_command'].to(dtype=torch.float32)
+		
+		state = torch.cat([speed, target_point, command], 1)
+		value = batch['value'].to(dtype=torch.float32).view(-1,1)
+		feature = batch['feature'].to(dtype=torch.float32)
+		gt_waypoints = batch['waypoints'].to(dtype=torch.float32)
+
+		pred = self.model(front_img, state, target_point)
+
+		speed_loss = F.l1_loss(pred['pred_speed'], speed) * self.config.speed_weight
+		value_loss = (F.mse_loss(pred['pred_value_traj'], value) + 
+					F.mse_loss(pred['pred_value_ctrl'], value)) * self.config.value_weight
+		feature_loss = (F.mse_loss(pred['pred_features_traj'], feature) + 
+						F.mse_loss(pred['pred_features_ctrl'], feature)) * self.config.features_weight
+		wp_loss = F.l1_loss(pred['pred_wp'], gt_waypoints, reduction='none').mean()
+
+		future_feature_loss = 0
+		for i in range(self.config.pred_len):
+			future_feature_loss += F.mse_loss(
+				pred['future_feature'][i], 
+				batch['future_feature'][i].to(dtype=torch.float32)
+			) * self.config.features_weight
+		future_feature_loss /= self.config.pred_len
+
+		# ---- Total loss ----
+		loss = speed_loss + value_loss + feature_loss + wp_loss + future_feature_loss
+
+		# ---- Logging ----
+		self.log('train_wp_loss_loss', wp_loss.item())
+		self.log('train_speed_loss', speed_loss.item())
+		self.log('train_value_loss', value_loss.item())
+		self.log('train_feature_loss', feature_loss.item())
+		self.log('train_future_feature_loss', future_feature_loss.item())
+
+		return loss.to(dtype=torch.float32)
+
 
 	def configure_optimizers(self):
 		optimizer = optim.Adam(self.parameters(), lr=self.lr, weight_decay=1e-7)
@@ -95,59 +170,113 @@ class TCP_planner(pl.LightningModule):
 
 	def validation_step(self, batch, batch_idx):
 		front_img = batch['front_img']
-		speed = batch['speed'].to(dtype=torch.float32).view(-1,1) / 12.
+		speed = batch['speed'].to(dtype=torch.float32).view(-1, 1) / 12.0
 		target_point = batch['target_point'].to(dtype=torch.float32)
-		command = batch['target_command']
+		command = batch['target_command'].to(dtype=torch.float32)
+
 		state = torch.cat([speed, target_point, command], 1)
-		value = batch['value'].view(-1,1)
-		feature = batch['feature']
-		gt_waypoints = batch['waypoints']
+		value = batch['value'].to(dtype=torch.float32).view(-1, 1)
+		feature = batch['feature'].to(dtype=torch.float32)
+		gt_waypoints = batch['waypoints'].to(dtype=torch.float32)
 
 		pred = self.model(front_img, state, target_point)
-		dist_sup = Beta(batch['action_mu'], batch['action_sigma'])
-		dist_pred = Beta(pred['mu_branches'], pred['sigma_branches'])
-		kl_div = torch.distributions.kl_divergence(dist_sup, dist_pred)
-		action_loss = torch.mean(kl_div[:, 0]) *0.5 + torch.mean(kl_div[:, 1]) *0.5
+
+		# ---- hız, değer, özellik, wp ----
 		speed_loss = F.l1_loss(pred['pred_speed'], speed) * self.config.speed_weight
-		value_loss = (F.mse_loss(pred['pred_value_traj'], value) + F.mse_loss(pred['pred_value_ctrl'], value)) * self.config.value_weight
-		feature_loss = (F.mse_loss(pred['pred_features_traj'], feature) +F.mse_loss(pred['pred_features_ctrl'], feature))* self.config.features_weight
+		value_loss = (F.mse_loss(pred['pred_value_traj'], value) +
+						F.mse_loss(pred['pred_value_ctrl'], value)) * self.config.value_weight
+		feature_loss = (F.mse_loss(pred['pred_features_traj'], feature) +
+						F.mse_loss(pred['pred_features_ctrl'], feature)) * self.config.features_weight
 		wp_loss = F.l1_loss(pred['pred_wp'], gt_waypoints, reduction='none').mean()
 
-		B = batch['action_mu'].shape[0]
-		batch_steer_l1 = 0 
-		batch_brake_l1 = 0
-		batch_throttle_l1 = 0
-		for i in range(B):
-			throttle, steer, brake = self.model.get_action(pred['mu_branches'][i], pred['sigma_branches'][i])
-			batch_throttle_l1 += torch.abs(throttle-batch['action'][i][0])
-			batch_steer_l1 += torch.abs(steer-batch['action'][i][1])
-			batch_brake_l1 += torch.abs(brake-batch['action'][i][2])
+		# ---- aksiyon L1 (deterministik) ----
+		acc_like = torch.clamp(pred['action'][:, 0], -1.0, 1.0)
+		steer_pred = torch.clamp(pred['action'][:, 1], -1.0, 1.0)
+		throttle_pred = torch.clamp(acc_like, 0.0, 1.0)
+		brake_pred = torch.clamp(-acc_like, 0.0, 1.0)
 
-		batch_throttle_l1 /= B
-		batch_steer_l1 /= B
-		batch_brake_l1 /= B
+		throttle_gt = batch['action'][:, 0].to(dtype=torch.float32)
+		steer_gt    = batch['action'][:, 1].to(dtype=torch.float32)
+		brake_gt    = batch['action'][:, 2].to(dtype=torch.float32)
 
-		future_feature_loss = 0
-		future_action_loss = 0
-		for i in range(self.config.pred_len-1):
-			dist_sup = Beta(batch['future_action_mu'][i], batch['future_action_sigma'][i])
-			dist_pred = Beta(pred['future_mu'][i], pred['future_sigma'][i])
-			kl_div = torch.distributions.kl_divergence(dist_sup, dist_pred)
-			future_action_loss += torch.mean(kl_div[:, 0]) *0.5 + torch.mean(kl_div[:, 1]) *0.5
-			future_feature_loss += F.mse_loss(pred['future_feature'][i], batch['future_feature'][i]) * self.config.features_weight
+		batch_throttle_l1 = torch.mean(torch.abs(throttle_pred - throttle_gt))
+		batch_steer_l1    = torch.mean(torch.abs(steer_pred    - steer_gt))
+		batch_brake_l1    = torch.mean(torch.abs(brake_pred    - brake_gt))
+
+		# ---- future feature ----
+		future_feature_loss = 0.0
+		for i in range(self.config.pred_len):
+			future_feature_loss += F.mse_loss(
+				pred['future_feature'][i],
+				batch['future_feature'][i].to(dtype=torch.float32)
+			) * self.config.features_weight
 		future_feature_loss /= self.config.pred_len
-		future_action_loss /= self.config.pred_len
 
-		val_loss = wp_loss + batch_throttle_l1+5*batch_steer_l1+batch_brake_l1
+		# ---- val loss (orijinale benzer)
+		val_loss = wp_loss + batch_throttle_l1 + 5 * batch_steer_l1 + batch_brake_l1
 
-		self.log("val_action_loss", action_loss.item(), sync_dist=True)
+		# ---- log ----
 		self.log('val_speed_loss', speed_loss.item(), sync_dist=True)
 		self.log('val_value_loss', value_loss.item(), sync_dist=True)
 		self.log('val_feature_loss', feature_loss.item(), sync_dist=True)
 		self.log('val_wp_loss_loss', wp_loss.item(), sync_dist=True)
 		self.log('val_future_feature_loss', future_feature_loss.item(), sync_dist=True)
-		self.log('val_future_action_loss', future_action_loss.item(), sync_dist=True)
+		self.log('val_throttle_l1', batch_throttle_l1.item(), sync_dist=True)
+		self.log('val_steer_l1', batch_steer_l1.item(), sync_dist=True)
+		self.log('val_brake_l1', batch_brake_l1.item(), sync_dist=True)
 		self.log('val_loss', val_loss.item(), sync_dist=True)
+
+	def validation_step_old(self, batch, batch_idx):
+		front_img = batch['front_img']
+		speed = batch['speed'].to(dtype=torch.float32).view(-1,1) / 12.
+		target_point = batch['target_point'].to(dtype=torch.float32)
+		command = batch['target_command'].to(dtype=torch.float32)
+		state = torch.cat([speed, target_point, command], 1)
+		value = batch['value'].to(dtype=torch.float32).view(-1,1)
+		feature = batch['feature'].to(dtype=torch.float32)
+		gt_waypoints = batch['waypoints'].to(dtype=torch.float32)
+
+		# forward
+		pred = self.model(front_img, state, target_point)
+
+		# ---- Losses ----
+		speed_loss = F.l1_loss(pred['pred_speed'], speed) * self.config.speed_weight
+		value_loss = (F.mse_loss(pred['pred_value_traj'], value) + 
+					F.mse_loss(pred['pred_value_ctrl'], value)) * self.config.value_weight
+		feature_loss = (F.mse_loss(pred['pred_features_traj'], feature) + 
+						F.mse_loss(pred['pred_features_ctrl'], feature)) * self.config.features_weight
+		wp_loss = F.l1_loss(pred['pred_wp'], gt_waypoints, reduction='none').mean()
+
+		# L1 action loss
+		B = batch['action'].shape[0]
+		batch_steer_l1, batch_brake_l1, batch_throttle_l1 = 0, 0, 0
+		for i in range(B):
+			throttle, steer, brake = self.model.get_action(
+				pred['mu_branches'][i], pred['sigma_branches'][i]
+			)
+			batch_throttle_l1 += torch.abs(throttle - batch['action'][i][0].to(dtype=torch.float32))
+			batch_steer_l1    += torch.abs(steer    - batch['action'][i][1].to(dtype=torch.float32))
+			batch_brake_l1    += torch.abs(brake    - batch['action'][i][2].to(dtype=torch.float32))
+
+		batch_throttle_l1 /= B
+		batch_steer_l1    /= B
+		batch_brake_l1    /= B
+
+		# future feature loss (action mu/sigma kısmı kaldırıldı)
+		future_feature_loss = 0
+		for i in range(self.config.pred_len-1):
+			future_feature_loss += F.mse_loss(
+				pred['future_feature'][i], 
+				batch['future_feature'][i].to(dtype=torch.float32)
+			) * self.config.features_weight
+		future_feature_loss /= self.config.pred_len
+
+		# total val loss
+		val_loss = (wp_loss + batch_throttle_l1 + 5*batch_steer_l1 + batch_brake_l1 + 
+					speed_loss + value_loss + feature_loss + future_feature_loss)
+		
+		self.log('val_loss', val_loss.item(), sync_dist=True)
+
 
 
 if __name__ == "__main__":
@@ -173,8 +302,8 @@ if __name__ == "__main__":
 	val_set = CARLA_Data(root=config.root_dir_all, data_folders=config.val_data,)
 	print(len(val_set))
 
-	dataloader_train = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=8)
-	dataloader_val = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=8)
+	dataloader_train = DataLoader(train_set, batch_size=16, shuffle=True, num_workers=8)
+	dataloader_val = DataLoader(val_set, batch_size=8, shuffle=False, num_workers=8)
 
 	TCP_model = TCP_planner(config, args.lr)
 
